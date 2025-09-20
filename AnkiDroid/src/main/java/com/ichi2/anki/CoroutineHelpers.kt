@@ -21,8 +21,11 @@ import android.app.Dialog
 import android.content.Context
 import android.content.DialogInterface
 import android.net.Uri
+import android.view.LayoutInflater
 import android.view.WindowManager
 import android.view.WindowManager.BadTokenException
+import android.widget.ProgressBar
+import android.widget.TextView
 import androidx.annotation.StringRes
 import androidx.appcompat.app.AlertDialog
 import androidx.core.net.toUri
@@ -387,7 +390,6 @@ suspend fun <T> Activity.withProgress(
         context = this@withProgress,
         onCancel = null,
     ) { dialog ->
-        @Suppress("Deprecation") // ProgressDialog deprecation
         dialog.setMessage(message)
         op()
     }
@@ -410,33 +412,108 @@ suspend fun <T> Fragment.withProgress(
     block: suspend () -> T,
 ): T = requireActivity().withProgress(messageId, block)
 
-@Suppress("Deprecation") // ProgressDialog deprecation
+/**
+ * Custom circular progress dialog that replaces the deprecated ProgressDialog.
+ * Shows a circular progress indicator with percentage text and status message.
+ */
+class CircularProgressDialog private constructor(
+    private val alertDialog: AlertDialog,
+    private val progressBar: ProgressBar,
+    private val progressText: TextView,
+    private val statusText: TextView
+) {
+    companion object {
+        fun create(
+            context: Context,
+            onCancel: (() -> Unit)?,
+            @StringRes manualCancelButton: Int? = null
+        ): CircularProgressDialog {
+            val inflater = LayoutInflater.from(context)
+            val view = inflater.inflate(R.layout.dialog_circular_progress, null)
+            
+            val progressBar = view.findViewById<ProgressBar>(R.id.circular_progress_bar)
+            val progressText = view.findViewById<TextView>(R.id.progress_text)
+            val statusText = view.findViewById<TextView>(R.id.status_text)
+            
+            val builder = AlertDialog.Builder(context, R.style.ThemeOverlay_AnkiDroid_AlertDialog)
+                .setView(view)
+                .setCancelable(onCancel != null)
+            
+            if (manualCancelButton != null) {
+                builder.setNegativeButton(manualCancelButton) { _, _ ->
+                    Timber.i("Progress dialog cancelled via cancel button")
+                    onCancel?.invoke()
+                }
+            }
+            
+            val alertDialog = builder.create()
+            
+            if (onCancel != null && manualCancelButton == null) {
+                alertDialog.setOnCancelListener {
+                    Timber.i("Progress dialog cancelled via cancel listener")
+                    onCancel.invoke()
+                }
+            }
+            
+            return CircularProgressDialog(alertDialog, progressBar, progressText, statusText)
+        }
+    }
+    
+    fun show() {
+        alertDialog.show()
+    }
+    
+    fun dismiss() {
+        alertDialog.dismiss()
+    }
+    
+    val isShowing: Boolean
+        get() = alertDialog.isShowing
+    
+    /**
+     * Updates the progress dialog with current progress information.
+     * @param statusText The status message to display below the progress bar
+     * @param current Current progress value (0 if indeterminate)
+     * @param total Total progress value (0 if indeterminate)
+     */
+    fun updateProgress(statusText: String, current: Int = 0, total: Int = 0) {
+        this.statusText.text = statusText
+        
+        if (total > 0 && current >= 0) {
+            // Determinate progress - show percentage
+            val percentage = ((current.toFloat() / total.toFloat()) * 100).toInt()
+            progressBar.isIndeterminate = false
+            progressBar.max = 100
+            progressBar.progress = percentage
+            progressText.text = alertDialog.context.getString(R.string.progress_percent, percentage)
+        } else {
+            // Indeterminate progress - show spinning indicator
+            progressBar.isIndeterminate = true
+            progressText.text = alertDialog.context.getString(R.string.progress_indeterminate)
+        }
+    }
+    
+    /**
+     * Sets a simple message for indeterminate progress.
+     */
+    fun setMessage(message: String) {
+        updateProgress(statusText = message, current = 0, total = 0)
+    }
+}
+
 suspend fun <T> withProgressDialog(
     context: Activity,
     onCancel: (() -> Unit)?,
     delayMillis: Long = 600,
     @StringRes manualCancelButton: Int? = null,
-    op: suspend (android.app.ProgressDialog) -> T,
+    op: suspend (CircularProgressDialog) -> T,
 ): T =
     coroutineScope {
-        val dialog =
-            android.app.ProgressDialog(context, R.style.AppCompatProgressDialogStyle).apply {
-                setCancelable(onCancel != null)
-                if (manualCancelButton != null) {
-                    setCancelable(false)
-                    setButton(DialogInterface.BUTTON_NEGATIVE, context.getString(manualCancelButton)) { _, _ ->
-                        Timber.i("Progress dialog cancelled via cancel button")
-                        onCancel?.let { it() }
-                    }
-                } else {
-                    onCancel?.let {
-                        setOnCancelListener {
-                            Timber.i("Progress dialog cancelled via cancel listener")
-                            it()
-                        }
-                    }
-                }
-            }
+        val dialog = CircularProgressDialog.create(
+            context = context,
+            onCancel = onCancel,
+            manualCancelButton = manualCancelButton
+        )
         // disable taps immediately
         context.window.setFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE, WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
         // reveal the dialog after 600ms
@@ -477,7 +554,7 @@ suspend fun <T> withProgressDialog(
         }
     }
 
-private fun dismissDialogIfShowing(dialog: Dialog) {
+private fun dismissDialogIfShowing(dialog: CircularProgressDialog) {
     try {
         if (dialog.isShowing) {
             dialog.dismiss()
@@ -523,18 +600,12 @@ data class ProgressContext(
     var amount: Pair<Int, Int>? = null,
 )
 
-@Suppress("Deprecation") // ProgressDialog deprecation
-private fun ProgressContext.updateDialog(dialog: android.app.ProgressDialog) {
-    // ideally this would show a progress bar, but MaterialDialog does not support
-    // setting progress after starting with indeterminate progress, so we just use
-    // this for now
-    // this code has since been updated to ProgressDialog, and the above not rechecked
-    val progressText =
-        amount?.let {
-            " ${it.first}/${it.second}"
-        } ?: ""
-    @Suppress("Deprecation") // ProgressDialog deprecation
-    dialog.setMessage(text + progressText)
+private fun ProgressContext.updateDialog(dialog: CircularProgressDialog) {
+    dialog.updateProgress(
+        statusText = text,
+        current = amount?.first ?: 0,
+        total = amount?.second ?: 0
+    )
 }
 
 /**
